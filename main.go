@@ -7,6 +7,11 @@ import (
 	"os"
 	"time"
 
+	"tui-worker-pool/logs"
+
+	"github.com/chdb-io/chdb-go/chdb"
+	slogmulti "github.com/samber/slog-multi"
+
 	"github.com/charmbracelet/bubbles/spinner"
 	"github.com/charmbracelet/bubbles/textinput"
 	tea "github.com/charmbracelet/bubbletea"
@@ -43,7 +48,7 @@ func (m *model) Init() tea.Cmd {
 
 // MARK: Update
 func (m *model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
-	m.logger.Info("Update", "msg", msg)
+	m.logger.Info("Update", "tea_msg", msg)
 	var cmd tea.Cmd
 
 	switch msg := msg.(type) {
@@ -197,13 +202,36 @@ func main() {
 	// Clear the terminal
 	fmt.Print("\033[H\033[2J")
 
-	// Create log file to dump debug logs to since the terminal
+	// Create tmp dir if it doesn't exist
+	if err := os.MkdirAll("tmp", os.ModePerm); err != nil {
+		log.Fatalf("error creating tmp dir: %v", err)
+	}
+
+	// fanout debug logs to in-process ClickHouse and local logs
+	session, err := chdb.NewSession("./tmp/chdb")
+	if err != nil {
+		log.Fatalf("error creating chdb session: %v", err)
+	}
+	defer session.Close()
+	chLogHandler := logs.NewClickHouseHandler(session)
+
+	// Create a log file to dump debug logs to since the terminal
 	// itself is reserved for the user interface.
-	f, err := os.OpenFile("log.json", os.O_RDWR|os.O_CREATE|os.O_APPEND, 0666)
+	// If it already exists, truncate it first.
+	f, err := os.OpenFile("tmp/log.txt", os.O_RDWR|os.O_CREATE|os.O_TRUNC, 0666)
 	if err != nil {
 		log.Fatalf("error opening file: %v", err)
 	}
 	defer f.Close()
+	textFileLogHandler := slog.NewTextHandler(f, nil)
+
+	// Create a new log file for json formatted logs
+	jsonFile, err := os.OpenFile("tmp/log.json", os.O_RDWR|os.O_CREATE|os.O_TRUNC, 0666)
+	if err != nil {
+		log.Fatalf("error opening file: %v", err)
+	}
+	defer jsonFile.Close()
+	jsonLogHandler := slog.NewJSONHandler(jsonFile, nil)
 
 	// Create a channel for workers to consume tasks from
 	const numJobs = 5
@@ -224,8 +252,14 @@ func main() {
 		a3:        Agent{model: spinner.New(spinner.WithSpinner(spinner.Dot), spinner.WithStyle(lipgloss.NewStyle().Foreground(lipgloss.Color("3"))))},
 		a4:        Agent{model: spinner.New(spinner.WithSpinner(spinner.Dot), spinner.WithStyle(lipgloss.NewStyle().Foreground(lipgloss.Color("4"))))},
 		a5:        Agent{model: spinner.New(spinner.WithSpinner(spinner.Dot), spinner.WithStyle(lipgloss.NewStyle().Foreground(lipgloss.Color("5"))))},
-		logger:    slog.New(slog.NewTextHandler(f, nil)),
-		outbound:  jobs,
+		logger: slog.New(
+			slogmulti.Fanout(
+				textFileLogHandler,
+				jsonLogHandler,
+				chLogHandler,
+			),
+		),
+		outbound: jobs,
 	})
 
 	// This starts up N workers, initially blocked because there are no jobs yet.

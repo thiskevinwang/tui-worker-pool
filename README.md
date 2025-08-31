@@ -22,3 +22,7 @@ go mod tidy
 go run main.go
 ctrl+c
 ```
+
+## Others
+
+https://github.com/chdb-io/chdb-go
